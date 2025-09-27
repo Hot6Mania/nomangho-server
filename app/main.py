@@ -52,14 +52,28 @@ def _playlist_key(room_id: str) -> str:
 def _videos_key(room_id: str) -> str:
     return f"room:{room_id}:videos"
 
+def _pending_key(room_id: str) -> str:
+    return f"room:{room_id}:pending"
+
 def _playlist_url(pid: str | None) -> str | None:
     return f"https://www.youtube.com/playlist?list={pid}" if pid else None
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+def _is_quota_exceeded(detail) -> bool:
+    try:
+        data = json.loads(detail) if isinstance(detail, str) else detail
+        err = data.get("error", {})
+        if err.get("code") == 403:
+            for e in err.get("errors", []):
+                if e.get("reason") == "quotaExceeded":
+                    return True
+    except Exception:
+        return False
+    return False
 
 async def get_access_token() -> str:
+    token = await redis.get("yt:access_token")
+    if token:
+        return token
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             "https://oauth2.googleapis.com/token",
@@ -72,7 +86,15 @@ async def get_access_token() -> str:
         )
         if resp.status_code != 200:
             raise HTTPException(status_code=500, detail=f"Token refresh failed: {resp.text}")
-        return resp.json()["access_token"]
+        data = resp.json()
+        token = data["access_token"]
+        ttl = max(60, int(data.get("expires_in", 3600)) - 60)
+        await redis.set("yt:access_token", token, ex=ttl)
+        return token
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
 @app.get("/oauth2/callback")
 async def oauth2_callback(request: Request):
@@ -94,6 +116,8 @@ async def search_videos(req: SearchRequest):
             params=params,
         )
         if resp.status_code != 200:
+            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
+                raise HTTPException(status_code=429, detail="YouTube quotaExceeded")
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         items = resp.json().get("items", [])
         results = []
@@ -119,6 +143,8 @@ async def create_playlist(title: str) -> str:
             json=body,
         )
         if resp.status_code != 200:
+            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
+                raise HTTPException(status_code=429, detail="YouTube quotaExceeded")
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp.json()["id"]
 
@@ -137,6 +163,8 @@ async def add_to_playlist_items(playlist_id: str, video_id: str):
             json=body,
         )
         if resp.status_code != 200:
+            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
+                raise HTTPException(status_code=429, detail="YouTube quotaExceeded")
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
 async def ensure_playlist_id(room_id: str, room_title: str) -> str:
@@ -156,6 +184,8 @@ async def add_track(req: AddRequest):
         raise HTTPException(status_code=400, detail="roomId/videoId required")
 
     videos_key = _videos_key(room_id)
+    pending_key = _pending_key(room_id)
+
     pre_added = await redis.sadd(videos_key, video_id)
     if pre_added == 0:
         pid = await redis.get(_playlist_key(room_id))
@@ -167,35 +197,69 @@ async def add_track(req: AddRequest):
             "videoId": video_id,
         }
 
-    pid = await ensure_playlist_id(room_id, room_title)
+    pid = None
     try:
+        pid = await ensure_playlist_id(room_id, room_title)
         await add_to_playlist_items(pid, video_id)
+        return {
+            "status": "added",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
     except HTTPException as e:
-        reason = None
-        try:
-            data = json.loads(e.detail) if isinstance(e.detail, str) else e.detail
-            reason = (data.get("error", {}).get("errors", [{}])[0].get("reason"))
-        except Exception:
-            pass
-        if e.status_code == 404 and reason == "playlistNotFound":
-            await redis.delete(_playlist_key(room_id))
-            pid = await ensure_playlist_id(room_id, room_title)
-            try:
-                await add_to_playlist_items(pid, video_id)
-            except Exception as e2:
-                await redis.srem(videos_key, video_id)
-                raise e2
-        else:
-            await redis.srem(videos_key, video_id)
-            raise
+        if e.status_code == 429 and str(e.detail) == "YouTube quotaExceeded":
+            await redis.lpush(pending_key, video_id)
+            pid = await redis.get(_playlist_key(room_id))
+            return {
+                "status": "queued",
+                "reason": "quotaExceeded",
+                "roomId": room_id,
+                "playlistId": pid,
+                "playlistUrl": _playlist_url(pid),
+                "videoId": video_id,
+            }
+        await redis.srem(videos_key, video_id)
+        raise
     except Exception:
         await redis.srem(videos_key, video_id)
         raise
 
-    return {
-        "status": "added",
-        "roomId": room_id,
-        "playlistId": pid,
-        "playlistUrl": _playlist_url(pid),
-        "videoId": video_id,
-    }
+@app.post("/flush")
+async def flush(roomId: str | None = None, maxOps: int = 100):
+    rooms = [roomId] if roomId else []
+    if not rooms:
+        pattern = "room:*:pending"
+        cursor = 0
+        while True:
+            cursor, keys = await redis.scan(cursor=cursor, match=pattern, count=100)
+            for k in keys:
+                rid = k.split(":")[1]
+                rooms.append(rid)
+            if cursor == 0:
+                break
+        rooms = list(dict.fromkeys(rooms))
+    processed = []
+    for rid in rooms:
+        pending_key = _pending_key(rid)
+        videos_key = _videos_key(rid)
+        pid = await ensure_playlist_id(rid, rid)
+        ops = 0
+        while ops < maxOps:
+            vid = await redis.rpop(pending_key)
+            if not vid:
+                break
+            try:
+                await add_to_playlist_items(pid, vid)
+                await redis.sadd(videos_key, vid)
+                processed.append({"roomId": rid, "videoId": vid, "status": "added"})
+            except HTTPException as e:
+                if e.status_code == 429 and str(e.detail) == "YouTube quotaExceeded":
+                    await redis.rpush(pending_key, vid)
+                    ops = maxOps
+                    break
+                await redis.srem(videos_key, vid)
+                processed.append({"roomId": rid, "videoId": vid, "status": "error", "detail": str(e.detail)})
+            ops += 1
+    return {"processed": processed}
