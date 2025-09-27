@@ -1,5 +1,7 @@
 import os
 import json
+import re
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -69,6 +71,32 @@ def _is_quota_exceeded(detail) -> bool:
     except Exception:
         return False
     return False
+
+def _extract_video_id(s: str | None) -> str | None:
+    if not s:
+        return None
+    s = s.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", s):
+        return s
+    try:
+        u = urlparse(s)
+        if u.scheme and u.netloc:
+            qs = parse_qs(u.query)
+            if "v" in qs and qs["v"]:
+                v = qs["v"][0]
+                if re.fullmatch(r"[A-Za-z0-9_-]{11}", v):
+                    return v
+            path = u.path or ""
+            m = re.search(r"/(embed|shorts)/([A-Za-z0-9_-]{11})", path)
+            if m:
+                return m.group(2)
+            m2 = re.search(r"/([A-Za-z0-9_-]{11})(?:\?|/|$)", path)
+            if m2:
+                return m2.group(1)
+    except Exception:
+        pass
+    m3 = re.search(r"([A-Za-z0-9_-]{11})", s)
+    return m3.group(1) if m3 else None
 
 async def get_access_token() -> str:
     token = await redis.get("yt:access_token")
@@ -179,7 +207,8 @@ async def ensure_playlist_id(room_id: str, room_title: str) -> str:
 async def add_track(req: AddRequest):
     room_id = (req.roomId or "").strip()
     room_title = (req.roomTitle or "").strip()
-    video_id = (req.videoId or "").strip()
+    raw = (req.videoId or "").strip()
+    video_id = _extract_video_id(raw)
     if not room_id or not video_id:
         raise HTTPException(status_code=400, detail="roomId/videoId required")
 
