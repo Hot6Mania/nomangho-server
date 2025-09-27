@@ -1,12 +1,15 @@
 import os
 import json
 import re
+import unicodedata
 from urllib.parse import urlparse, parse_qs, urlencode
+from typing import List, Optional, Dict
+from datetime import timedelta
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from redis.asyncio import Redis
 
@@ -24,9 +27,15 @@ while True:
     crefresh = os.getenv(f"YOUTUBE_REFRESH_TOKEN{i}")
     YT_CLIENTS.append({"id": cid, "secret": csecret, "refresh": crefresh})
     i += 1
-
 if not YT_CLIENTS:
     raise RuntimeError("No YouTube client credentials configured")
+
+YOUTUBE_API_KEYS = [s.strip() for s in os.getenv("YOUTUBE_API_KEYS", "").split(",") if s.strip()]
+if YOUTUBE_API_KEYS:
+    from itertools import cycle
+    _api_key_cycle = cycle(YOUTUBE_API_KEYS)
+else:
+    _api_key_cycle = None
 
 app = FastAPI(title="Nomangho YouTube Playlist API")
 
@@ -44,6 +53,27 @@ class AddRequest(BaseModel):
     roomId: str
     roomTitle: str
     videoId: str
+
+class SearchReq(BaseModel):
+    query: str = Field(..., min_length=2, max_length=160)
+    channel_hint: Optional[str] = Field(None, max_length=120)
+    duration_hint_sec: Optional[int] = Field(None, ge=5, le=60*60*3)
+    max_results: int = Field(8, ge=1, le=15)
+    region: Optional[str] = "KR"
+    lang: Optional[str] = "ko"
+
+class Candidate(BaseModel):
+    videoId: str
+    title: str
+    channelTitle: str
+    channelId: str
+    durationSec: Optional[int] = None
+    score: float
+
+class SearchRes(BaseModel):
+    best: Optional[Candidate]
+    alternatives: List[Candidate] = []
+    reason: Optional[str] = None
 
 @app.on_event("startup")
 async def _startup():
@@ -184,7 +214,6 @@ async def auth_url(request: Request):
     }
     return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params), "index": idx + 1}
 
-
 @app.get("/oauth2/callback")
 async def oauth2_callback(request: Request):
     code = request.query_params.get("code")
@@ -212,7 +241,6 @@ async def oauth2_callback(request: Request):
     if "refresh_token" in data:
         await redis.set(f"yt:refresh_token:{idx}", data["refresh_token"])
     return {"index": idx + 1, **data}
-
 
 async def create_playlist(title: str) -> str:
     body = {
@@ -250,6 +278,173 @@ async def ensure_playlist_id(room_id: str, room_title: str) -> str:
     pid = await create_playlist(room_title or room_id)
     await redis.set(_playlist_key(room_id), pid)
     return pid
+
+def _normalize(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s or "")
+    s = re.sub(r"[\[\(（【].*?[\]\)）】]", " ", s)
+    s = re.sub(r"[^\w\uAC00-\uD7A3\u3040-\u30FF\u4E00-\u9FFF ]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+def _jaro_winkler(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    s1, s2 = a, b
+    r = max(len(s1), len(s2)) // 2 - 1
+    flags1 = [False] * len(s1)
+    flags2 = [False] * len(s2)
+    m = 0
+    t = 0
+    for i, ch in enumerate(s1):
+        for j in range(max(0, i - r), min(len(s2), i + r + 1)):
+            if not flags2[j] and s2[j] == ch:
+                flags1[i] = flags2[j] = True
+                m += 1
+                break
+    if m == 0:
+        return 0.0
+    k = 0
+    for i in range(len(s1)):
+        if flags1[i]:
+            while not flags2[k]:
+                k += 1
+            if s1[i] != s2[k]:
+                t += 1
+            k += 1
+    t /= 2
+    jw = (m / len(s1) + m / len(s2) + (m - t) / m) / 3
+    l = 0
+    for i in range(min(4, len(s1), len(s2))):
+        if s1[i] == s2[i]:
+            l += 1
+        else:
+            break
+    return jw + 0.1 * l * (1 - jw)
+
+def _iso8601_to_sec(dur: str) -> Optional[int]:
+    m = re.match(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", dur or "")
+    if not m:
+        return None
+    h = int(m.group(1) or 0)
+    mi = int(m.group(2) or 0)
+    s = int(m.group(3) or 0)
+    return h * 3600 + mi * 60 + s
+
+async def _yt_search_with_key(http: httpx.AsyncClient, key: str, q: str, max_results: int, region: str, lang: str):
+    params = {
+        "key": key,
+        "part": "snippet",
+        "type": "video",
+        "maxResults": max_results,
+        "q": q,
+        "regionCode": region,
+        "relevanceLanguage": lang,
+        "fields": "items(id/videoId,snippet/title,snippet/channelId,snippet/channelTitle)"
+    }
+    r = await http.get("https://www.googleapis.com/youtube/v3/search", params=params, timeout=10)
+    r.raise_for_status()
+    return r.json().get("items", [])
+
+async def _yt_videos_with_key(http: httpx.AsyncClient, key: str, ids: List[str]):
+    params = {
+        "key": key,
+        "part": "snippet,contentDetails",
+        "id": ",".join(ids),
+        "fields": "items(id,snippet/title,snippet/channelId,snippet/channelTitle,contentDetails/duration)"
+    }
+    r = await http.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=10)
+    r.raise_for_status()
+    return r.json().get("items", [])
+
+async def _yt_search_with_oauth(q: str, max_results: int, region: str, lang: str):
+    params = {
+        "part": "snippet",
+        "type": "video",
+        "maxResults": str(max_results),
+        "q": q,
+        "regionCode": region,
+        "relevanceLanguage": lang,
+        "fields": "items(id/videoId,snippet/title,snippet/channelId,snippet/channelTitle)"
+    }
+    resp = await youtube_request("GET", "https://www.googleapis.com/youtube/v3/search", params=params)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json().get("items", [])
+
+async def _yt_videos_with_oauth(ids: List[str]):
+    params = {
+        "part": "snippet,contentDetails",
+        "id": ",".join(ids),
+        "fields": "items(id,snippet/title,snippet/channelId,snippet/channelTitle,contentDetails/duration)"
+    }
+    resp = await youtube_request("GET", "https://www.googleapis.com/youtube/v3/videos", params=params)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json().get("items", [])
+
+def _score_candidate(q_norm: str, ch_norm: str, cand_title: str, cand_ch: str, dur_hint: Optional[int], dur_sec: Optional[int]) -> float:
+    title_norm = _normalize(cand_title)
+    chname_norm = _normalize(cand_ch)
+    score = 0.0
+    if q_norm in title_norm:
+        score += 0.55
+    score += 0.35 * _jaro_winkler(q_norm, title_norm)
+    if ch_norm and (ch_norm == chname_norm or ch_norm in chname_norm or chname_norm in ch_norm):
+        score += 0.2
+    if dur_hint and dur_sec:
+        if 0.9 * dur_hint <= dur_sec <= 1.1 * dur_hint:
+            score += 0.1
+        else:
+            score -= 0.05
+    return score
+
+@app.post("/search", response_model=SearchRes)
+async def search(req: SearchReq):
+    q_norm = _normalize(req.query)
+    ch_norm = _normalize(req.channel_hint or "")
+    if len(q_norm) < 2:
+        raise HTTPException(400, detail="query too short after normalization")
+    cache_key = f"ytsearch:v2:{req.region}:{req.lang}:{q_norm}|{ch_norm}|{req.max_results}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return SearchRes(**json.loads(cached))
+    if _api_key_cycle:
+        key = next(_api_key_cycle)
+        async with httpx.AsyncClient() as http:
+            items = await _yt_search_with_key(http, key, req.query, req.max_results, req.region, req.lang)
+            ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+            meta = await _yt_videos_with_key(http, key, ids) if ids else []
+    else:
+        items = await _yt_search_with_oauth(req.query, req.max_results, req.region, req.lang)
+        ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+        meta = await _yt_videos_with_oauth(ids) if ids else []
+    id2m: Dict[str, dict] = {m["id"]: m for m in meta}
+    cands: List[Candidate] = []
+    for it in items:
+        vid = it["id"]["videoId"]
+        m = id2m.get(vid)
+        if not m:
+            continue
+        dur = _iso8601_to_sec(m.get("contentDetails", {}).get("duration"))
+        score = _score_candidate(q_norm, ch_norm, m["snippet"]["title"], m["snippet"]["channelTitle"], req.duration_hint_sec, dur)
+        cands.append(Candidate(
+            videoId=vid,
+            title=m["snippet"]["title"],
+            channelTitle=m["snippet"]["channelTitle"],
+            channelId=m["snippet"]["channelId"],
+            durationSec=dur,
+            score=round(score, 4)
+        ))
+    cands.sort(key=lambda x: x.score, reverse=True)
+    best = cands[0] if cands else None
+    if not best or best.score < 0.62:
+        res = SearchRes(best=None, alternatives=cands[:5], reason="ambiguous_or_low_score" if cands else "no_results")
+    else:
+        res = SearchRes(best=best, alternatives=cands[1:5])
+    await redis.setex(cache_key, int(timedelta(hours=24).total_seconds()), json.dumps(res.dict()))
+    return res
 
 @app.post("/add")
 async def add_track(req: AddRequest):
@@ -334,8 +529,6 @@ async def flush(roomId: str | None = None, maxOps: int = 100):
                     ops = maxOps
                     break
                 await redis.srem(videos_key, vid)
-                processed.append(
-                    {"roomId": rid, "videoId": vid, "status": "error", "detail": str(e.detail)}
-                )
+                processed.append({"roomId": rid, "videoId": vid, "status": "error", "detail": str(e.detail)})
             ops += 1
     return {"processed": processed}
