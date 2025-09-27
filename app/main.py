@@ -697,19 +697,14 @@ async def _resolve_track_candidate(track_name: str, artist: str, duration_hint: 
 async def add_track(req: AddRequest):
     room_id = (req.roomId or "").strip()
     room_title = (req.roomTitle or "").strip()
-    if not room_id:
-        log.warning(json.dumps({"type": "add_bad_request", "roomId": room_id}))
-        raise HTTPException(status_code=400, detail="roomId required")
-    direct_vid = _resolve_video_id(req.videoId, req.url)
-    if direct_vid:
-        return await _process_add(room_id, room_title, direct_vid)
     track_name = (req.trackName or "").strip()
     artist = (req.artist or "").strip()
-    if not track_name or not artist:
+    if not room_id or not track_name or not artist:
         log.warning(json.dumps({"type": "add_bad_request", "roomId": room_id, "trackName": track_name, "artist": artist}))
-        raise HTTPException(status_code=400, detail="trackName/artist required")
+        raise HTTPException(status_code=400, detail="roomId/trackName/artist required")
     candidate = await _resolve_track_candidate(track_name, artist, req.durationSec)
-    return await _process_add(room_id, room_title, candidate.videoId)
+    res = await _process_add(room_id, room_title, candidate.videoId)
+    return res
 
 @app.post("/add/url")
 async def add_by_url(req: AddByUrlRequest):
