@@ -81,7 +81,7 @@ redis: Redis | None = None
 _TRACK_RESOLVE_CACHE_PREFIX = "trackresolve:v1"
 _TRACK_RESOLVE_TTL = int(timedelta(hours=12).total_seconds())
 _TRACK_RESOLVE_MISS_TTL = int(timedelta(minutes=30).total_seconds())
-_TRACK_RESOLVE_THRESHOLD = 0.68
+_TRACK_RESOLVE_THRESHOLD = 0.58
 _TRACK_RESOLVE_MISS_SENTINEL = "__MISS__"
 
 class AddRequest(BaseModel):
@@ -441,6 +441,35 @@ async def _process_add(room_id: str, room_title: str, video_id: str):
                 "playlistUrl": _playlist_url(pid),
                 "videoId": video_id,
             }
+        if e.status_code == 404 and _is_playlist_not_found(e.detail):
+            await redis.delete(_playlist_key(room_id))
+            log.warning(json.dumps({"type": "playlist_not_found_recreate", "roomId": room_id, "oldPlaylistId": pid}))
+            new_pid = await ensure_playlist_id(room_id, room_title)
+            try:
+                await add_to_playlist_items(new_pid, video_id)
+                await redis.sadd(videos_key, video_id)
+                log.info(json.dumps({"type": "add_success_after_recreate", "roomId": room_id, "playlistId": new_pid, "videoId": video_id}))
+                return {
+                    "status": "added",
+                    "roomId": room_id,
+                    "playlistId": new_pid,
+                    "playlistUrl": _playlist_url(new_pid),
+                    "videoId": video_id,
+                }
+            except HTTPException as e2:
+                if e2.status_code == 429 and "quotaExceeded" in str(e2.detail):
+                    await redis.lpush(pending_key, video_id)
+                    log.warning(json.dumps({"type": "add_queued_quota_after_recreate", "roomId": room_id, "videoId": video_id, "playlistId": new_pid}))
+                    return {
+                        "status": "queued",
+                        "reason": "quotaExceeded",
+                        "roomId": room_id,
+                        "playlistId": new_pid,
+                        "playlistUrl": _playlist_url(new_pid),
+                        "videoId": video_id,
+                    }
+                log.error(json.dumps({"type": "add_failed_after_recreate", "roomId": room_id, "videoId": video_id, "status": e2.status_code, "detail": str(e2.detail)[:500]}))
+                raise
         await redis.srem(videos_key, video_id)
         log.error(json.dumps({"type": "add_failed_http", "roomId": room_id, "videoId": video_id, "status": e.status_code, "detail": str(e.detail)[:500]}))
         raise
@@ -783,3 +812,15 @@ async def _video_in_playlist(playlist_id: str, video_id: str) -> bool:
     data = resp.json()
     items = data.get("items", [])
     return bool(items)
+
+def _is_playlist_not_found(detail: str | dict) -> bool:
+    try:
+        data = json.loads(detail) if isinstance(detail, str) else detail
+        err = data.get("error", {})
+        if err.get("code") == 404:
+            for e in err.get("errors", []):
+                if e.get("reason") == "playlistNotFound":
+                    return True
+    except Exception:
+        pass
+    return False
