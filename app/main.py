@@ -1,29 +1,31 @@
 import os
+from collections import defaultdict
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from redis.asyncio import Redis
 
 load_dotenv()
 
 CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID")
 CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET")
 REFRESH_TOKEN = os.getenv("YOUTUBE_REFRESH_TOKEN")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
 app = FastAPI(title="Nomangho YouTube Playlist API")
 
-# CORS: 확장/클라이언트 접근 허용 (필요한 경우 도메인만 지정 가능)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 필요시 "https://sync-tube.de", "chrome-extension://<ID>" 등으로 좁히기
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# roomId -> playlistId (메모리 캐시; 영속 필요하면 DB로 교체)
-room_playlists: dict[str, str] = {}
+redis: Redis | None = None
 
 class SearchRequest(BaseModel):
     query: str
@@ -33,6 +35,25 @@ class AddRequest(BaseModel):
     roomId: str
     roomTitle: str
     videoId: str
+
+@app.on_event("startup")
+async def _startup():
+    global redis
+    redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
+@app.on_event("shutdown")
+async def _shutdown():
+    if redis:
+        await redis.aclose()
+
+def _playlist_key(room_id: str) -> str:
+    return f"room:{room_id}:playlist"
+
+def _videos_key(room_id: str) -> str:
+    return f"room:{room_id}:videos"
+
+def _playlist_url(pid: str | None) -> str | None:
+    return f"https://www.youtube.com/playlist?list={pid}" if pid else None
 
 @app.get("/health")
 async def health():
@@ -101,7 +122,7 @@ async def create_playlist(title: str) -> str:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return resp.json()["id"]
 
-async def add_to_playlist(playlist_id: str, video_id: str):
+async def add_to_playlist_items(playlist_id: str, video_id: str):
     token = await get_access_token()
     body = {
         "snippet": {
@@ -118,20 +139,44 @@ async def add_to_playlist(playlist_id: str, video_id: str):
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
+async def ensure_playlist_id(room_id: str, room_title: str) -> str:
+    pid = await redis.get(_playlist_key(room_id))
+    if pid:
+        return pid
+    pid = await create_playlist(room_title or room_id)
+    await redis.set(_playlist_key(room_id), pid)
+    return pid
+
 @app.post("/add")
 async def add_track(req: AddRequest):
-    # 1) roomId 매핑 확인
-    playlist_id = room_playlists.get(req.roomId)
-    # 2) 없으면 새로 생성
-    if not playlist_id:
-        playlist_id = await create_playlist(req.roomTitle)
-        room_playlists[req.roomId] = playlist_id
-    # 3) 영상 추가
-    await add_to_playlist(playlist_id, req.videoId)
+    room_id = (req.roomId or "").strip()
+    room_title = (req.roomTitle or "").strip()
+    video_id = (req.videoId or "").strip()
+    if not room_id or not video_id:
+        raise HTTPException(status_code=400, detail="roomId/videoId required")
+
+    videos_key = _videos_key(room_id)
+    pre_added = await redis.sadd(videos_key, video_id)
+    if pre_added == 0:
+        pid = await redis.get(_playlist_key(room_id))
+        return {
+            "status": "skipped",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
+
+    pid = await ensure_playlist_id(room_id, room_title)
+    try:
+        await add_to_playlist_items(pid, video_id)
+    except Exception as e:
+        await redis.srem(videos_key, video_id)
+        raise
     return {
-        "status": "ok",
-        "roomId": req.roomId,
-        "playlistId": playlist_id,
-        "playlistUrl": f"https://www.youtube.com/playlist?list={playlist_id}",
-        "videoId": req.videoId,
+        "status": "added",
+        "roomId": room_id,
+        "playlistId": pid,
+        "playlistUrl": _playlist_url(pid),
+        "videoId": video_id,
     }

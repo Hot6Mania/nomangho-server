@@ -6,5 +6,6 @@ dependencies = [
   "fastapi",
   "uvicorn[standard]",
   "httpx",
-  "python-dotenv"
+  "python-dotenv",
+  "redis>=6.4.0",
 ]
