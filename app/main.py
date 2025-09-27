@@ -1,7 +1,7 @@
 import os
 import json
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -12,10 +12,21 @@ from redis.asyncio import Redis
 
 load_dotenv()
 
-CLIENT_ID = os.getenv("YOUTUBE_CLIENT_ID")
-CLIENT_SECRET = os.getenv("YOUTUBE_CLIENT_SECRET")
-REFRESH_TOKEN = os.getenv("YOUTUBE_REFRESH_TOKEN")
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+YT_CLIENTS = []
+i = 1
+while True:
+    cid = os.getenv(f"YOUTUBE_CLIENT_ID{i}")
+    csecret = os.getenv(f"YOUTUBE_CLIENT_SECRET{i}")
+    crefresh = os.getenv(f"YOUTUBE_REFRESH_TOKEN{i}")
+    if not (cid and csecret and crefresh):
+        break
+    YT_CLIENTS.append({"id": cid, "secret": csecret, "refresh": crefresh})
+    i += 1
+
+if not YT_CLIENTS:
+    raise RuntimeError("No YouTube client credentials configured")
 
 app = FastAPI(title="Nomangho YouTube Playlist API")
 
@@ -28,10 +39,6 @@ app.add_middleware(
 )
 
 redis: Redis | None = None
-
-class SearchRequest(BaseModel):
-    query: str
-    maxResults: int = 5
 
 class AddRequest(BaseModel):
     roomId: str
@@ -98,102 +105,130 @@ def _extract_video_id(s: str | None) -> str | None:
     m3 = re.search(r"([A-Za-z0-9_-]{11})", s)
     return m3.group(1) if m3 else None
 
+async def get_current_index() -> int:
+    idx = await redis.get("yt:client_index")
+    return int(idx or 0)
+
+async def set_current_index(idx: int):
+    await redis.set("yt:client_index", idx % len(YT_CLIENTS))
+
 async def get_access_token() -> str:
-    token = await redis.get("yt:access_token")
+    idx = await get_current_index()
+    client = YT_CLIENTS[idx]
+    token_key = f"yt:access_token:{idx}"
+    token = await redis.get(token_key)
     if token:
         return token
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
+    async with httpx.AsyncClient(timeout=10) as client_http:
+        resp = await client_http.post(
             "https://oauth2.googleapis.com/token",
             data={
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "refresh_token": REFRESH_TOKEN,
+                "client_id": client["id"],
+                "client_secret": client["secret"],
+                "refresh_token": client["refresh"],
                 "grant_type": "refresh_token",
             },
         )
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Token refresh failed: {resp.text}")
-        data = resp.json()
-        token = data["access_token"]
-        ttl = max(60, int(data.get("expires_in", 3600)) - 60)
-        await redis.set("yt:access_token", token, ex=ttl)
-        return token
+    if resp.status_code != 200:
+        await set_current_index(idx + 1)
+        raise HTTPException(status_code=500, detail=f"Token refresh failed: {resp.text}")
+    data = resp.json()
+    token = data["access_token"]
+    ttl = max(60, int(data.get("expires_in", 3600)) - 60)
+    await redis.set(token_key, token, ex=ttl)
+    return token
+
+async def youtube_request(method: str, url: str, **kwargs):
+    for _ in range(len(YT_CLIENTS)):
+        try:
+            token = await get_access_token()
+            headers = kwargs.pop("headers", {})
+            headers["Authorization"] = f"Bearer {token}"
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.request(method, url, headers=headers, **kwargs)
+            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
+                idx = await get_current_index()
+                await set_current_index(idx + 1)
+                continue
+            return resp
+        except HTTPException:
+            idx = await get_current_index()
+            await set_current_index(idx + 1)
+            continue
+    raise HTTPException(status_code=429, detail="All clients quotaExceeded")
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
+@app.get("/auth/url")
+async def auth_url():
+    idx = await get_current_index()
+    client = YT_CLIENTS[idx]
+    redirect_uri = os.getenv("YOUTUBE_REDIRECT_URI", "http://127.0.0.1:5000/oauth2/callback")
+    params = {
+        "client_id": client["id"],
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "https://www.googleapis.com/auth/youtube",
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+    }
+    return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)}
+
 @app.get("/oauth2/callback")
 async def oauth2_callback(request: Request):
-    return {"query_params": dict(request.query_params)}
-
-@app.post("/search")
-async def search_videos(req: SearchRequest):
-    token = await get_access_token()
-    params = {
-        "part": "snippet",
-        "q": req.query,
-        "type": "video",
-        "maxResults": max(1, min(req.maxResults, 10)),
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            "https://www.googleapis.com/youtube/v3/search",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
+    code = request.query_params.get("code")
+    if not code:
+        return {"error": "missing code"}
+    idx = await get_current_index()
+    client = YT_CLIENTS[idx]
+    redirect_uri = os.getenv("YOUTUBE_REDIRECT_URI", "http://127.0.0.1:5000/oauth2/callback")
+    async with httpx.AsyncClient(timeout=10) as client_http:
+        resp = await client_http.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": client["id"],
+                "client_secret": client["secret"],
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": redirect_uri,
+            },
         )
-        if resp.status_code != 200:
-            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
-                raise HTTPException(status_code=429, detail="YouTube quotaExceeded")
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        items = resp.json().get("items", [])
-        results = []
-        for it in items:
-            results.append({
-                "videoId": it["id"]["videoId"],
-                "title": it["snippet"]["title"],
-                "channel": it["snippet"]["channelTitle"],
-                "thumbnail": (it["snippet"].get("thumbnails", {}).get("default", {}) or {}).get("url"),
-            })
-        return {"query": req.query, "results": results}
+    data = resp.json()
+    if "refresh_token" in data:
+        await redis.set(f"yt:refresh_token:{idx}", data["refresh_token"])
+    return data
 
 async def create_playlist(title: str) -> str:
-    token = await get_access_token()
     body = {
         "snippet": {"title": title, "description": "Auto-created from SyncTube"},
         "status": {"privacyStatus": "public"},
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            "https://www.googleapis.com/youtube/v3/playlists?part=snippet,status",
-            headers={"Authorization": f"Bearer {token}"},
-            json=body,
-        )
-        if resp.status_code != 200:
-            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
-                raise HTTPException(status_code=429, detail="YouTube quotaExceeded")
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
-        return resp.json()["id"]
+    resp = await youtube_request(
+        "POST",
+        "https://www.googleapis.com/youtube/v3/playlists?part=snippet,status",
+        json=body,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()["id"]
 
 async def add_to_playlist_items(playlist_id: str, video_id: str):
-    token = await get_access_token()
     body = {
         "snippet": {
             "playlistId": playlist_id,
             "resourceId": {"kind": "youtube#video", "videoId": video_id},
         }
     }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet",
-            headers={"Authorization": f"Bearer {token}"},
-            json=body,
-        )
-        if resp.status_code != 200:
-            if resp.status_code == 403 and _is_quota_exceeded(resp.text):
-                raise HTTPException(status_code=429, detail="YouTube quotaExceeded")
-            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    resp = await youtube_request(
+        "POST",
+        "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet",
+        json=body,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
 
 async def ensure_playlist_id(room_id: str, room_title: str) -> str:
     pid = await redis.get(_playlist_key(room_id))
@@ -211,10 +246,8 @@ async def add_track(req: AddRequest):
     video_id = _extract_video_id(raw)
     if not room_id or not video_id:
         raise HTTPException(status_code=400, detail="roomId/videoId required")
-
     videos_key = _videos_key(room_id)
     pending_key = _pending_key(room_id)
-
     pre_added = await redis.sadd(videos_key, video_id)
     if pre_added == 0:
         pid = await redis.get(_playlist_key(room_id))
@@ -225,7 +258,6 @@ async def add_track(req: AddRequest):
             "playlistUrl": _playlist_url(pid),
             "videoId": video_id,
         }
-
     pid = None
     try:
         pid = await ensure_playlist_id(room_id, room_title)
@@ -238,7 +270,7 @@ async def add_track(req: AddRequest):
             "videoId": video_id,
         }
     except HTTPException as e:
-        if e.status_code == 429 and str(e.detail) == "YouTube quotaExceeded":
+        if e.status_code == 429 and "quotaExceeded" in str(e.detail):
             await redis.lpush(pending_key, video_id)
             pid = await redis.get(_playlist_key(room_id))
             return {
@@ -284,11 +316,13 @@ async def flush(roomId: str | None = None, maxOps: int = 100):
                 await redis.sadd(videos_key, vid)
                 processed.append({"roomId": rid, "videoId": vid, "status": "added"})
             except HTTPException as e:
-                if e.status_code == 429 and str(e.detail) == "YouTube quotaExceeded":
+                if e.status_code == 429 and "quotaExceeded" in str(e.detail):
                     await redis.rpush(pending_key, vid)
                     ops = maxOps
                     break
                 await redis.srem(videos_key, vid)
-                processed.append({"roomId": rid, "videoId": vid, "status": "error", "detail": str(e.detail)})
+                processed.append(
+                    {"roomId": rid, "videoId": vid, "status": "error", "detail": str(e.detail)}
+                )
             ops += 1
     return {"processed": processed}
