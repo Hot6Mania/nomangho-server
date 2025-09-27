@@ -180,16 +180,21 @@ async def auth_url(request: Request):
         "access_type": "offline",
         "include_granted_scopes": "true",
         "prompt": "consent",
+        "state": str(idx)
     }
     return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params), "index": idx + 1}
+
 
 @app.get("/oauth2/callback")
 async def oauth2_callback(request: Request):
     code = request.query_params.get("code")
-    raw = request.query_params.get("i")
-    idx = int(raw) - 1 if raw and raw.isdigit() else await get_current_index()
+    state = request.query_params.get("state")
     if not code:
         return {"error": "missing code"}
+    if state is not None and state.isdigit():
+        idx = int(state)
+    else:
+        idx = await get_current_index()
     client = YT_CLIENTS[idx]
     redirect_uri = os.getenv("YOUTUBE_REDIRECT_URI", "http://127.0.0.1:5000/oauth2/callback")
     async with httpx.AsyncClient(timeout=10) as client_http:
@@ -207,6 +212,7 @@ async def oauth2_callback(request: Request):
     if "refresh_token" in data:
         await redis.set(f"yt:refresh_token:{idx}", data["refresh_token"])
     return {"index": idx + 1, **data}
+
 
 async def create_playlist(title: str) -> str:
     body = {
