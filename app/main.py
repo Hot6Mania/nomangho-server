@@ -63,7 +63,8 @@ redis: Redis | None = None
 class AddRequest(BaseModel):
     roomId: str
     roomTitle: str
-    videoId: str
+    videoId: Optional[str] = None
+    url: Optional[str] = None
 
 class SearchReq(BaseModel):
     query: str = Field(..., min_length=2, max_length=160)
@@ -157,6 +158,16 @@ def _extract_video_id(s: str | None) -> str | None:
         pass
     m3 = re.search(r"([A-Za-z0-9_-]{11})", s)
     return m3.group(1) if m3 else None
+
+
+def _resolve_video_id(*candidates: str | None) -> Optional[str]:
+    for raw in candidates:
+        if not raw:
+            continue
+        vid = _extract_video_id(raw)
+        if vid:
+            return vid
+    return None
 
 async def get_current_index() -> int:
     idx = await redis.get("yt:client_index")
@@ -301,6 +312,50 @@ async def ensure_playlist_id(room_id: str, room_title: str) -> str:
     pid = await create_playlist(_playlist_title(room_title, room_id))
     await redis.set(_playlist_key(room_id), pid)
     return pid
+
+
+async def _process_add(room_id: str, room_title: str, video_id: str):
+    videos_key = _videos_key(room_id)
+    pending_key = _pending_key(room_id)
+    pre_added = await redis.sadd(videos_key, video_id)
+    if pre_added == 0:
+        pid = await redis.get(_playlist_key(room_id))
+        return {
+            "status": "skipped",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
+
+    pid = None
+    try:
+        pid = await ensure_playlist_id(room_id, room_title)
+        await add_to_playlist_items(pid, video_id)
+        return {
+            "status": "added",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
+    except HTTPException as e:
+        if e.status_code == 429 and "quotaExceeded" in str(e.detail):
+            await redis.lpush(pending_key, video_id)
+            pid = pid or await redis.get(_playlist_key(room_id))
+            return {
+                "status": "queued",
+                "reason": "quotaExceeded",
+                "roomId": room_id,
+                "playlistId": pid,
+                "playlistUrl": _playlist_url(pid),
+                "videoId": video_id,
+            }
+        await redis.srem(videos_key, video_id)
+        raise
+    except Exception:
+        await redis.srem(videos_key, video_id)
+        raise
 
 def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
@@ -473,101 +528,19 @@ async def search(req: SearchReq):
 async def add_track(req: AddRequest):
     room_id = (req.roomId or "").strip()
     room_title = (req.roomTitle or "").strip()
-    raw = (req.videoId or "").strip()
-    video_id = _extract_video_id(raw)
+    video_id = _resolve_video_id(req.videoId, req.url)
     if not room_id or not video_id:
-        raise HTTPException(status_code=400, detail="roomId/videoId required")
-    videos_key = _videos_key(room_id)
-    pending_key = _pending_key(room_id)
-    pre_added = await redis.sadd(videos_key, video_id)
-    if pre_added == 0:
-        pid = await redis.get(_playlist_key(room_id))
-        return {
-            "status": "skipped",
-            "roomId": room_id,
-            "playlistId": pid,
-            "playlistUrl": _playlist_url(pid),
-            "videoId": video_id,
-        }
-    pid = None
-    try:
-        pid = await ensure_playlist_id(room_id, room_title)
-        await add_to_playlist_items(pid, video_id)
-        return {
-            "status": "added",
-            "roomId": room_id,
-            "playlistId": pid,
-            "playlistUrl": _playlist_url(pid),
-            "videoId": video_id,
-        }
-    except HTTPException as e:
-        if e.status_code == 429 and "quotaExceeded" in str(e.detail):
-            await redis.lpush(pending_key, video_id)
-            pid = await redis.get(_playlist_key(room_id))
-            return {
-                "status": "queued",
-                "reason": "quotaExceeded",
-                "roomId": room_id,
-                "playlistId": pid,
-                "playlistUrl": _playlist_url(pid),
-                "videoId": video_id,
-            }
-        await redis.srem(videos_key, video_id)
-        raise
-    except Exception:
-        await redis.srem(videos_key, video_id)
-        raise
+        raise HTTPException(status_code=400, detail="roomId and video identifier required")
+    return await _process_add(room_id, room_title, video_id)
 
 @app.post("/add/url")
 async def add_by_url(req: AddByUrlRequest):
     room_id = (req.roomId or "").strip()
     room_title = (req.roomTitle or "").strip()
-    video_id = _extract_video_id((req.url or "").strip())
+    video_id = _resolve_video_id(req.url)
     if not room_id or not video_id:
         raise HTTPException(status_code=400, detail="roomId/url required")
-
-    videos_key = _videos_key(room_id)
-    pending_key = _pending_key(room_id)
-
-    pre_added = await redis.sadd(videos_key, video_id)
-    if pre_added == 0:
-        pid = await redis.get(_playlist_key(room_id))
-        return {
-            "status": "skipped",
-            "roomId": room_id,
-            "playlistId": pid,
-            "playlistUrl": _playlist_url(pid),
-            "videoId": video_id,
-        }
-
-    pid = None
-    try:
-        pid = await ensure_playlist_id(room_id, room_title)
-        await add_to_playlist_items(pid, video_id)
-        return {
-            "status": "added",
-            "roomId": room_id,
-            "playlistId": pid,
-            "playlistUrl": _playlist_url(pid),
-            "videoId": video_id,
-        }
-    except HTTPException as e:
-        if e.status_code == 429 and "quotaExceeded" in str(e.detail):
-            await redis.lpush(pending_key, video_id)
-            pid = await redis.get(_playlist_key(room_id))
-            return {
-                "status": "queued",
-                "reason": "quotaExceeded",
-                "roomId": room_id,
-                "playlistId": pid,
-                "playlistUrl": _playlist_url(pid),
-                "videoId": video_id,
-            }
-        await redis.srem(videos_key, video_id)
-        raise
-    except Exception:
-        await redis.srem(videos_key, video_id)
-        raise
+    return await _process_add(room_id, room_title, video_id)
 
 @app.post("/flush")
 async def flush(roomId: str | None = None, maxOps: int = 100):
