@@ -60,11 +60,20 @@ app.add_middleware(
 
 redis: Redis | None = None
 
+_TRACK_RESOLVE_CACHE_PREFIX = "trackresolve:v1"
+_TRACK_RESOLVE_TTL = int(timedelta(hours=12).total_seconds())
+_TRACK_RESOLVE_MISS_TTL = int(timedelta(minutes=30).total_seconds())
+_TRACK_RESOLVE_THRESHOLD = 0.68
+_TRACK_RESOLVE_MISS_SENTINEL = "__MISS__"
+
 class AddRequest(BaseModel):
     roomId: str
     roomTitle: str
     videoId: Optional[str] = None
     url: Optional[str] = None
+    trackName: Optional[str] = None
+    artist: Optional[str] = None
+    durationSec: Optional[int] = Field(None, ge=5, le=60*60*3)
 
 class SearchReq(BaseModel):
     query: str = Field(..., min_length=2, max_length=160)
@@ -478,8 +487,7 @@ def _score_candidate(q_norm: str, ch_norm: str, cand_title: str, cand_ch: str, d
             score -= 0.05
     return score
 
-@app.post("/search", response_model=SearchRes)
-async def search(req: SearchReq):
+async def _perform_search(req: SearchReq) -> SearchRes:
     q_norm = _normalize(req.query)
     ch_norm = _normalize(req.channel_hint or "")
     if len(q_norm) < 2:
@@ -524,14 +532,63 @@ async def search(req: SearchReq):
     await redis.setex(cache_key, int(timedelta(hours=24).total_seconds()), json.dumps(res.dict()))
     return res
 
+
+@app.post("/search", response_model=SearchRes)
+async def search(req: SearchReq):
+    return await _perform_search(req)
+
+
+async def _resolve_track_candidate(track_name: str, artist: str, duration_hint: Optional[int]) -> Candidate:
+    track_raw = (track_name or "").strip()
+    artist_raw = (artist or "").strip()
+    if not track_raw or not artist_raw:
+        raise HTTPException(status_code=400, detail="trackName and artist required")
+    track_norm = _normalize(track_raw)
+    artist_norm = _normalize(artist_raw)
+    if len(track_norm) < 2 or len(artist_norm) < 2:
+        raise HTTPException(status_code=400, detail="trackName and artist required")
+    cache_key = f"{_TRACK_RESOLVE_CACHE_PREFIX}:{track_norm}|{artist_norm}|{duration_hint or 0}"
+    cached = await redis.get(cache_key)
+    if cached:
+        if cached == _TRACK_RESOLVE_MISS_SENTINEL:
+            raise HTTPException(status_code=404, detail="matching video not found")
+        try:
+            data = json.loads(cached)
+            return Candidate(**data)
+        except Exception:
+            await redis.delete(cache_key)
+    search_req = SearchReq(
+        query=f"{track_raw} {artist_raw}",
+        channel_hint=artist_raw,
+        duration_hint_sec=duration_hint,
+        max_results=8,
+    )
+    res = await _perform_search(search_req)
+    best = res.best
+    if not best or best.score < _TRACK_RESOLVE_THRESHOLD:
+        await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
+        raise HTTPException(status_code=404, detail="matching video not found")
+    title_norm = _normalize(best.title)
+    channel_norm = _normalize(best.channelTitle)
+    title_similarity = _jaro_winkler(track_norm, title_norm)
+    artist_similarity = _jaro_winkler(artist_norm, channel_norm)
+    artist_present = artist_norm in title_norm or artist_norm in channel_norm or artist_similarity >= 0.85
+    if title_similarity < 0.7 or not artist_present:
+        await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
+        raise HTTPException(status_code=404, detail="matching video not found")
+    await redis.setex(cache_key, _TRACK_RESOLVE_TTL, json.dumps(best.dict()))
+    return best
+
 @app.post("/add")
 async def add_track(req: AddRequest):
     room_id = (req.roomId or "").strip()
     room_title = (req.roomTitle or "").strip()
-    video_id = _resolve_video_id(req.videoId, req.url)
-    if not room_id or not video_id:
-        raise HTTPException(status_code=400, detail="roomId and video identifier required")
-    return await _process_add(room_id, room_title, video_id)
+    track_name = (req.trackName or "").strip()
+    artist = (req.artist or "").strip()
+    if not room_id or not track_name or not artist:
+        raise HTTPException(status_code=400, detail="roomId/trackName/artist required")
+    candidate = await _resolve_track_candidate(track_name, artist, req.durationSec)
+    return await _process_add(room_id, room_title, candidate.videoId)
 
 @app.post("/add/url")
 async def add_by_url(req: AddByUrlRequest):
