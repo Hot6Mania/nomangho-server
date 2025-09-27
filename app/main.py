@@ -1,5 +1,5 @@
 import os
-from collections import defaultdict
+import json
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -170,9 +170,28 @@ async def add_track(req: AddRequest):
     pid = await ensure_playlist_id(room_id, room_title)
     try:
         await add_to_playlist_items(pid, video_id)
-    except Exception as e:
+    except HTTPException as e:
+        reason = None
+        try:
+            data = json.loads(e.detail) if isinstance(e.detail, str) else e.detail
+            reason = (data.get("error", {}).get("errors", [{}])[0].get("reason"))
+        except Exception:
+            pass
+        if e.status_code == 404 and reason == "playlistNotFound":
+            await redis.delete(_playlist_key(room_id))
+            pid = await ensure_playlist_id(room_id, room_title)
+            try:
+                await add_to_playlist_items(pid, video_id)
+            except Exception as e2:
+                await redis.srem(videos_key, video_id)
+                raise e2
+        else:
+            await redis.srem(videos_key, video_id)
+            raise
+    except Exception:
         await redis.srem(videos_key, video_id)
         raise
+
     return {
         "status": "added",
         "roomId": room_id,
