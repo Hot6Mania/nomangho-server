@@ -1,6 +1,6 @@
 import os
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -52,6 +52,10 @@ async def get_access_token() -> str:
         if resp.status_code != 200:
             raise HTTPException(status_code=500, detail=f"Token refresh failed: {resp.text}")
         return resp.json()["access_token"]
+
+@app.get("/oauth2/callback")
+async def oauth2_callback(request: Request):
+    return {"query_params": dict(request.query_params)}
 
 @app.post("/search")
 async def search_videos(req: SearchRequest):
