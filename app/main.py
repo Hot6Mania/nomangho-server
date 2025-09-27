@@ -110,7 +110,7 @@ async def create_playlist(title: str) -> str:
     token = await get_access_token()
     body = {
         "snippet": {"title": title, "description": "Auto-created from SyncTube"},
-        "status": {"privacyStatus": "unlisted"},
+        "status": {"privacyStatus": "public"},
     }
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
