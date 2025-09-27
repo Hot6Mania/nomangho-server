@@ -396,21 +396,31 @@ async def ensure_playlist_id(room_id: str, room_title: str) -> str:
 async def _process_add(room_id: str, room_title: str, video_id: str):
     videos_key = _videos_key(room_id)
     pending_key = _pending_key(room_id)
-    pre_added = await redis.sadd(videos_key, video_id)
-    if pre_added == 0:
-        pid = await redis.get(_playlist_key(room_id))
-        log.info(json.dumps({"type": "add_skipped_duplicate", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
-        return {
-            "status": "skipped",
-            "roomId": room_id,
-            "playlistId": pid,
-            "playlistUrl": _playlist_url(pid),
-            "videoId": video_id,
-        }
-    pid = None
-    try:
+
+    pid = await redis.get(_playlist_key(room_id))
+    if not pid:
         pid = await ensure_playlist_id(room_id, room_title)
+
+    if await redis.sismember(videos_key, video_id):
+        try:
+            exists = await _video_in_playlist(pid, video_id)
+        except HTTPException:
+            exists = False
+        if exists:
+            log.info(json.dumps({"type": "add_skipped_duplicate_confirmed", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
+            return {
+                "status": "skipped",
+                "roomId": room_id,
+                "playlistId": pid,
+                "playlistUrl": _playlist_url(pid),
+                "videoId": video_id,
+            }
+        else:
+            log.warning(json.dumps({"type": "add_inconsistent_state_retrying", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
+
+    try:
         await add_to_playlist_items(pid, video_id)
+        await redis.sadd(videos_key, video_id)
         log.info(json.dumps({"type": "add_success", "roomId": room_id, "playlistId": pid, "videoId": video_id}))
         return {
             "status": "added",
@@ -422,7 +432,6 @@ async def _process_add(room_id: str, room_title: str, video_id: str):
     except HTTPException as e:
         if e.status_code == 429 and "quotaExceeded" in str(e.detail):
             await redis.lpush(pending_key, video_id)
-            pid = pid or await redis.get(_playlist_key(room_id))
             log.warning(json.dumps({"type": "add_queued_quota", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
             return {
                 "status": "queued",
@@ -439,6 +448,8 @@ async def _process_add(room_id: str, room_title: str, video_id: str):
         await redis.srem(videos_key, video_id)
         log.exception(json.dumps({"type": "add_failed_exception", "roomId": room_id, "videoId": video_id, "error": str(ex)}))
         raise
+
+
 
 def _normalize(s: str) -> str:
     s = unicodedata.normalize("NFKC", s or "")
@@ -756,3 +767,19 @@ async def flush(roomId: str | None = None, maxOps: int = 100):
             ops += 1
         log.info(json.dumps({"type": "flush_room_done", "roomId": rid, "processed": len(processed)}))
     return {"processed": processed}
+
+async def _video_in_playlist(playlist_id: str, video_id: str) -> bool:
+    params = {
+        "part": "snippet",
+        "playlistId": playlist_id,
+        "videoId": video_id,
+        "maxResults": "1",
+        "fields": "items/snippet/resourceId/videoId"
+    }
+    resp = await youtube_request("GET", "https://www.googleapis.com/youtube/v3/playlistItems", params=params)
+    if resp.status_code != 200:
+        log.error(json.dumps({"type": "playlist_check_failed", "playlistId": playlist_id, "videoId": video_id, "status": resp.status_code, "text": resp.text[:500]}))
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    items = data.get("items", [])
+    return bool(items)
