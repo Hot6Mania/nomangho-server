@@ -565,36 +565,27 @@ def _score_candidate(
     title_norm = _normalize(cand_title)
     chname_norm = _normalize(cand_ch)
     score = 0.0
-
     if track_norm and track_norm in title_norm:
         score += 0.55
-
     score += 0.35 * _jaro_winkler(q_norm, title_norm)
-
     if ch_norm and (ch_norm == chname_norm or ch_norm in chname_norm or chname_norm in ch_norm):
         score += 0.2
-
     if dur_hint and dur_sec:
         if 0.9 * dur_hint <= dur_sec <= 1.1 * dur_hint:
             score += 0.1
         else:
             score -= 0.05
-
     return score
 
-async def _perform_search(req: SearchReq) -> SearchRes:
+
+async def _perform_search(req: SearchReq, *, skip_cache: bool = False, track_norm: Optional[str] = None) -> SearchRes:
     q_norm = _normalize(req.query)
     ch_norm = _normalize(req.channel_hint or "")
-    track_norm = None
-
-    if hasattr(req, "trackName") and req.trackName:
-        track_norm = _normalize(req.trackName)
-
     if len(q_norm) < 2:
         log.warning(json.dumps({"type": "search_reject_short", "q_norm": q_norm}))
         raise HTTPException(400, detail="query too short after normalization")
-    cache_key = f"ytsearch:v2:{req.region}:{req.lang}:{q_norm}|{ch_norm}|{req.max_results}"
-    cached = await redis.get(cache_key)
+    cache_key = f"ytsearch:v3:{req.region}:{req.lang}:{q_norm}|{ch_norm}|{req.max_results}|{track_norm or ''}"
+    cached = None if skip_cache else await redis.get(cache_key)
     if cached:
         try:
             res = SearchRes(**json.loads(cached))
@@ -644,7 +635,8 @@ async def _perform_search(req: SearchReq) -> SearchRes:
         res = SearchRes(best=None, alternatives=cands[:5], reason="ambiguous_or_low_score" if cands else "no_results")
     else:
         res = SearchRes(best=best, alternatives=cands[1:5])
-    await redis.setex(cache_key, int(timedelta(hours=24).total_seconds()), json.dumps(res.dict()))
+    if not skip_cache:
+        await redis.setex(cache_key, int(timedelta(hours=24).total_seconds()), json.dumps(res.dict()))
     log.info(json.dumps({"type": "search_done", "q": req.query, "best_score": float(best.score) if best else None, "alts": len(res.alternatives), "reason": res.reason}))
     return res
 
@@ -682,7 +674,7 @@ async def _resolve_track_candidate(track_name: str, artist: str, duration_hint: 
         duration_hint_sec=duration_hint,
         max_results=8,
     )
-    res = await _perform_search(search_req)
+    res = await _perform_search(search_req, skip_cache=True, track_norm=_normalize(track_raw))
     best = res.best
     if not best or best.score < _TRACK_RESOLVE_THRESHOLD:
         await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
@@ -705,14 +697,19 @@ async def _resolve_track_candidate(track_name: str, artist: str, duration_hint: 
 async def add_track(req: AddRequest):
     room_id = (req.roomId or "").strip()
     room_title = (req.roomTitle or "").strip()
+    if not room_id:
+        log.warning(json.dumps({"type": "add_bad_request", "roomId": room_id}))
+        raise HTTPException(status_code=400, detail="roomId required")
+    direct_vid = _resolve_video_id(req.videoId, req.url)
+    if direct_vid:
+        return await _process_add(room_id, room_title, direct_vid)
     track_name = (req.trackName or "").strip()
     artist = (req.artist or "").strip()
-    if not room_id or not track_name or not artist:
+    if not track_name or not artist:
         log.warning(json.dumps({"type": "add_bad_request", "roomId": room_id, "trackName": track_name, "artist": artist}))
-        raise HTTPException(status_code=400, detail="roomId/trackName/artist required")
+        raise HTTPException(status_code=400, detail="trackName/artist required")
     candidate = await _resolve_track_candidate(track_name, artist, req.durationSec)
-    res = await _process_add(room_id, room_title, candidate.videoId)
-    return res
+    return await _process_add(room_id, room_title, candidate.videoId)
 
 @app.post("/add/url")
 async def add_by_url(req: AddByUrlRequest):
