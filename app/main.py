@@ -553,25 +553,43 @@ async def _yt_videos_with_oauth(ids: List[str]):
     log.info(json.dumps({"type": "yt_videos_oauth", "count": len(data)}))
     return data
 
-def _score_candidate(q_norm: str, ch_norm: str, cand_title: str, cand_ch: str, dur_hint: Optional[int], dur_sec: Optional[int]) -> float:
+def _score_candidate(
+    q_norm: str,
+    ch_norm: str,
+    cand_title: str,
+    cand_ch: str,
+    dur_hint: Optional[int],
+    dur_sec: Optional[int],
+    track_norm: Optional[str] = None
+) -> float:
     title_norm = _normalize(cand_title)
     chname_norm = _normalize(cand_ch)
     score = 0.0
-    if q_norm in title_norm:
+
+    if track_norm and track_norm in title_norm:
         score += 0.55
+
     score += 0.35 * _jaro_winkler(q_norm, title_norm)
+
     if ch_norm and (ch_norm == chname_norm or ch_norm in chname_norm or chname_norm in ch_norm):
         score += 0.2
+
     if dur_hint and dur_sec:
         if 0.9 * dur_hint <= dur_sec <= 1.1 * dur_hint:
             score += 0.1
         else:
             score -= 0.05
+
     return score
 
 async def _perform_search(req: SearchReq) -> SearchRes:
     q_norm = _normalize(req.query)
     ch_norm = _normalize(req.channel_hint or "")
+    track_norm = None
+
+    if hasattr(req, "trackName") and req.trackName:
+        track_norm = _normalize(req.trackName)
+
     if len(q_norm) < 2:
         log.warning(json.dumps({"type": "search_reject_short", "q_norm": q_norm}))
         raise HTTPException(400, detail="query too short after normalization")
@@ -603,7 +621,15 @@ async def _perform_search(req: SearchReq) -> SearchRes:
         if not m:
             continue
         dur = _iso8601_to_sec(m.get("contentDetails", {}).get("duration"))
-        score = _score_candidate(q_norm, ch_norm, m["snippet"]["title"], m["snippet"]["channelTitle"], req.duration_hint_sec, dur)
+        score = _score_candidate(
+            q_norm,
+            ch_norm,
+            m["snippet"]["title"],
+            m["snippet"]["channelTitle"],
+            req.duration_hint_sec,
+            dur,
+            track_norm=track_norm,
+        )
         cands.append(Candidate(
             videoId=vid,
             title=m["snippet"]["title"],
