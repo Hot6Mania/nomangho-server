@@ -4,7 +4,12 @@ import re
 import unicodedata
 from urllib.parse import urlparse, parse_qs, urlencode
 from typing import List, Optional, Dict
-from datetime import timedelta
+from datetime import datetime, timedelta
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None  # type: ignore
 
 
 import httpx
@@ -102,6 +107,18 @@ def _pending_key(room_id: str) -> str:
 
 def _playlist_url(pid: str | None) -> str | None:
     return f"https://www.youtube.com/playlist?list={pid}" if pid else None
+
+
+def _playlist_title(room_title: str | None, room_id: str) -> str:
+    base_name = (room_title or "").strip() or (room_id or "").strip() or "Playlist"
+    tz = None
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo("Asia/Seoul")
+        except Exception:
+            tz = None
+    now = datetime.now(tz) if tz else datetime.utcnow()
+    return f"{now.strftime('%y.%m.%d')} - {base_name}"
 
 def _is_quota_exceeded(detail) -> bool:
     try:
@@ -281,7 +298,7 @@ async def ensure_playlist_id(room_id: str, room_title: str) -> str:
     pid = await redis.get(_playlist_key(room_id))
     if pid:
         return pid
-    pid = await create_playlist(room_title or room_id)
+    pid = await create_playlist(_playlist_title(room_title, room_id))
     await redis.set(_playlist_key(room_id), pid)
     return pid
 
