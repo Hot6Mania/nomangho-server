@@ -6,12 +6,18 @@ from urllib.parse import urlparse, parse_qs, urlencode
 from typing import List, Optional, Dict
 from datetime import timedelta
 
+
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from redis.asyncio import Redis
+
+class AddByUrlRequest(BaseModel):
+    roomId: str
+    roomTitle: str
+    url: str
 
 load_dotenv()
 
@@ -466,6 +472,57 @@ async def add_track(req: AddRequest):
             "playlistUrl": _playlist_url(pid),
             "videoId": video_id,
         }
+    pid = None
+    try:
+        pid = await ensure_playlist_id(room_id, room_title)
+        await add_to_playlist_items(pid, video_id)
+        return {
+            "status": "added",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
+    except HTTPException as e:
+        if e.status_code == 429 and "quotaExceeded" in str(e.detail):
+            await redis.lpush(pending_key, video_id)
+            pid = await redis.get(_playlist_key(room_id))
+            return {
+                "status": "queued",
+                "reason": "quotaExceeded",
+                "roomId": room_id,
+                "playlistId": pid,
+                "playlistUrl": _playlist_url(pid),
+                "videoId": video_id,
+            }
+        await redis.srem(videos_key, video_id)
+        raise
+    except Exception:
+        await redis.srem(videos_key, video_id)
+        raise
+
+@app.post("/add/url")
+async def add_by_url(req: AddByUrlRequest):
+    room_id = (req.roomId or "").strip()
+    room_title = (req.roomTitle or "").strip()
+    video_id = _extract_video_id((req.url or "").strip())
+    if not room_id or not video_id:
+        raise HTTPException(status_code=400, detail="roomId/url required")
+
+    videos_key = _videos_key(room_id)
+    pending_key = _pending_key(room_id)
+
+    pre_added = await redis.sadd(videos_key, video_id)
+    if pre_added == 0:
+        pid = await redis.get(_playlist_key(room_id))
+        return {
+            "status": "skipped",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
+
     pid = None
     try:
         pid = await ensure_playlist_id(room_id, room_title)
