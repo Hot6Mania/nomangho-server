@@ -263,8 +263,20 @@ async def get_access_token() -> str:
             },
         )
     if resp.status_code != 200:
+        try:
+            err = resp.json()
+            if err.get("error") == "invalid_grant":
+                await redis.delete(f"yt:refresh_token:{idx}")
+                log.error(json.dumps({"type": "yt_refresh_invalid_grant", "index": idx}))
+        except Exception:
+            pass
         await set_current_index(idx + 1)
-        log.error(json.dumps({"type": "yt_token_refresh_failed", "index": idx, "status": resp.status_code, "text": resp.text[:500]}))
+        log.error(json.dumps({
+            "type": "yt_token_refresh_failed",
+            "index": idx,
+            "status": resp.status_code,
+            "text": resp.text[:500]
+        }))
         raise HTTPException(status_code=500, detail=f"Token refresh failed: {resp.text}")
     data = resp.json()
     token = data["access_token"]
@@ -302,6 +314,19 @@ async def youtube_request(method: str, url: str, **kwargs):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+@app.post("/oauth/refresh-all")
+async def oauth_refresh_all():
+    results = []
+    for idx in range(len(YT_CLIENTS)):
+        try:
+            token_key = f"yt:access_token:{idx}"
+            await redis.delete(token_key)
+            _ = await get_access_token()
+            results.append({"index": idx, "ok": True})
+        except Exception as e:
+            results.append({"index": idx, "ok": False, "error": str(e)})
+    return {"results": results}
 
 @app.get("/auth/url")
 async def auth_url(request: Request):
