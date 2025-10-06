@@ -101,7 +101,7 @@ class AddRequest(BaseModel):
     durationSec: Optional[int] = Field(None, ge=5, le=60*60*3)
 
 class SearchReq(BaseModel):
-    query: str = Field(..., min_length=2, max_length=160)
+    query: str = Field(..., min_length=1, max_length=160)
     channel_hint: Optional[str] = Field(None, max_length=120)
     duration_hint_sec: Optional[int] = Field(None, ge=5, le=60*60*3)
     max_results: int = Field(8, ge=1, le=15)
@@ -656,8 +656,7 @@ def _score_candidate(
 async def _perform_search(req: SearchReq, *, skip_cache: bool = False, track_norm: Optional[str] = None) -> SearchRes:
     q_norm = _normalize(req.query)
     ch_norm = _normalize(req.channel_hint or "")
-    if len(q_norm) < 2:
-        log.warning(json.dumps({"type": "search_reject_short", "q_norm": q_norm}))
+    if len(q_norm) < 1:
         raise HTTPException(400, detail="query too short after normalization")
     cache_key = f"ytsearch:v3:{req.region}:{req.lang}:{q_norm}|{ch_norm}|{req.max_results}|{track_norm or ''}"
     cached = None if skip_cache else await redis.get(cache_key)
@@ -722,50 +721,54 @@ async def search(req: SearchReq):
 async def _resolve_track_candidate(track_name: str, artist: str, duration_hint: Optional[int]) -> Candidate:
     track_raw = (track_name or "").strip()
     artist_raw = (artist or "").strip()
-    if not track_raw or not artist_raw:
-        log.warning(json.dumps({"type": "resolve_missing_fields", "track": track_raw, "artist": artist_raw}))
-        raise HTTPException(status_code=400, detail="trackName and artist required")
+    if not artist_raw:
+        raise HTTPException(status_code=400, detail="artist required")
+
     track_norm = _normalize(track_raw)
     artist_norm = _normalize(artist_raw)
-    if len(track_norm) < 2 or len(artist_norm) < 2:
-        log.warning(json.dumps({"type": "resolve_too_short", "track_norm": track_norm, "artist_norm": artist_norm}))
-        raise HTTPException(status_code=400, detail="trackName and artist required")
+    if len(artist_norm) < 1:
+        raise HTTPException(status_code=400, detail="artist required")
+
     cache_key = f"{_TRACK_RESOLVE_CACHE_PREFIX}:{track_norm}|{artist_norm}|{duration_hint or 0}"
     cached = await redis.get(cache_key)
     if cached:
         if cached == _TRACK_RESOLVE_MISS_SENTINEL:
-            log.info(json.dumps({"type": "resolve_cache_miss_hit", "key": cache_key}))
             raise HTTPException(status_code=404, detail="matching video not found")
         try:
             data = json.loads(cached)
-            log.info(json.dumps({"type": "resolve_cache_hit", "key": cache_key}))
             return Candidate(**data)
         except Exception:
             await redis.delete(cache_key)
-            log.warning(json.dumps({"type": "resolve_cache_corrupt", "key": cache_key}))
+
+    q = f"{track_raw} {artist_raw}".strip() or artist_raw
     search_req = SearchReq(
-        query=f"{track_raw} {artist_raw}",
+        query=q,
         channel_hint=artist_raw,
         duration_hint_sec=duration_hint,
         max_results=8,
     )
-    res = await _perform_search(search_req, skip_cache=True, track_norm=_normalize(track_raw))
+    res = await _perform_search(search_req, skip_cache=True, track_norm=track_norm if track_raw else None)
     best = res.best
-    if not best or best.score < _TRACK_RESOLVE_THRESHOLD:
+    if not best:
         await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
-        log.info(json.dumps({"type": "resolve_no_confident_match", "key": cache_key, "best_score": float(best.score) if best else None}))
         raise HTTPException(status_code=404, detail="matching video not found")
+
     title_norm = _normalize(best.title)
     channel_norm = _normalize(best.channelTitle)
-    title_similarity = _jaro_winkler(track_norm, title_norm)
+    title_similarity = _jaro_winkler(track_norm, title_norm) if track_norm else 0.0
     artist_similarity = _jaro_winkler(artist_norm, channel_norm)
     artist_present = artist_norm in title_norm or artist_norm in channel_norm or artist_similarity >= 0.85
-    if title_similarity < 0.7 or not artist_present:
-        await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
-        log.info(json.dumps({"type": "resolve_reject_similarity", "key": cache_key, "title_sim": title_similarity, "artist_sim": artist_similarity, "artist_present": artist_present}))
-        raise HTTPException(status_code=404, detail="matching video not found")
+
+    if track_norm:
+        if title_similarity < 0.7 or not artist_present:
+            await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
+            raise HTTPException(status_code=404, detail="matching video not found")
+    else:
+        if not artist_present or best.score < 0.48:
+            await redis.setex(cache_key, _TRACK_RESOLVE_MISS_TTL, _TRACK_RESOLVE_MISS_SENTINEL)
+            raise HTTPException(status_code=404, detail="matching video not found")
+
     await redis.setex(cache_key, _TRACK_RESOLVE_TTL, json.dumps(best.dict()))
-    log.info(json.dumps({"type": "resolve_ok", "key": cache_key, "videoId": best.videoId, "score": float(best.score)}))
     return best
 
 @app.post("/add")
@@ -774,9 +777,8 @@ async def add_track(req: AddRequest):
     room_title = (req.roomTitle or "").strip()
     track_name = (req.trackName or "").strip()
     artist = (req.artist or "").strip()
-    if not room_id or not track_name or not artist:
-        log.warning(json.dumps({"type": "add_bad_request", "roomId": room_id, "trackName": track_name, "artist": artist}))
-        raise HTTPException(status_code=400, detail="roomId/trackName/artist required")
+    if not room_id or not artist:
+        raise HTTPException(status_code=400, detail="roomId/artist required")
     candidate = await _resolve_track_candidate(track_name, artist, req.durationSec)
     res = await _process_add(room_id, room_title, candidate.videoId)
     return res
