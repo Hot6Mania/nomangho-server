@@ -311,6 +311,16 @@ async def youtube_request(method: str, url: str, **kwargs):
     log.error(json.dumps({"type": "yt_all_clients_exhausted"}))
     raise HTTPException(status_code=429, detail="All clients quotaExceeded")
 
+async def _acquire_lock(key: str, ttl: int = 20) -> bool:
+    return bool(await redis.set(key, "1", ex=ttl, nx=True))
+
+async def _release_lock(key: str):
+    try:
+        await redis.delete(key)
+    except Exception:
+        pass
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
@@ -440,32 +450,41 @@ async def ensure_playlist_id(room_id: str, room_title: str) -> str:
 async def _process_add(room_id: str, room_title: str, video_id: str):
     videos_key = _videos_key(room_id)
     pending_key = _pending_key(room_id)
+    lock_key = f"lock:add:{room_id}:{video_id}"
 
     pid = await redis.get(_playlist_key(room_id))
     if not pid:
         pid = await ensure_playlist_id(room_id, room_title)
 
-    if await redis.sismember(videos_key, video_id):
-        try:
-            exists = await _video_in_playlist(pid, video_id)
-        except HTTPException:
-            exists = False
-        if exists:
-            log.info(json.dumps({"type": "add_skipped_duplicate_confirmed", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
-            return {
-                "status": "skipped",
-                "roomId": room_id,
-                "playlistId": pid,
-                "playlistUrl": _playlist_url(pid),
-                "videoId": video_id,
-            }
-        else:
-            log.warning(json.dumps({"type": "add_inconsistent_state_retrying", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
+    if not await _acquire_lock(lock_key, ttl=30):
+        log.info(json.dumps({"type": "add_in_progress", "roomId": room_id, "videoId": video_id}))
+        return {
+            "status": "in_progress",
+            "roomId": room_id,
+            "playlistId": pid,
+            "playlistUrl": _playlist_url(pid),
+            "videoId": video_id,
+        }
 
     try:
+        try:
+            if await _video_in_playlist(pid, video_id):
+                await redis.sadd(videos_key, video_id)
+                log.info(json.dumps({"type":"add_skipped_already_in_playlist","roomId":room_id,"playlistId":pid,"videoId":video_id}))
+                return {
+                    "status": "skipped",
+                    "roomId": room_id,
+                    "playlistId": pid,
+                    "playlistUrl": _playlist_url(pid),
+                    "videoId": video_id,
+                }
+        except HTTPException:
+            pass
+
         await add_to_playlist_items(pid, video_id)
+
         await redis.sadd(videos_key, video_id)
-        log.info(json.dumps({"type": "add_success", "roomId": room_id, "playlistId": pid, "videoId": video_id}))
+        log.info(json.dumps({"type":"add_success","roomId":room_id,"playlistId":pid,"videoId":video_id}))
         return {
             "status": "added",
             "roomId": room_id,
@@ -473,10 +492,11 @@ async def _process_add(room_id: str, room_title: str, video_id: str):
             "playlistUrl": _playlist_url(pid),
             "videoId": video_id,
         }
+
     except HTTPException as e:
         if e.status_code == 429 and "quotaExceeded" in str(e.detail):
             await redis.lpush(pending_key, video_id)
-            log.warning(json.dumps({"type": "add_queued_quota", "roomId": room_id, "videoId": video_id, "playlistId": pid}))
+            log.warning(json.dumps({"type":"add_queued_quota","roomId":room_id,"videoId":video_id,"playlistId":pid}))
             return {
                 "status": "queued",
                 "reason": "quotaExceeded",
@@ -485,42 +505,13 @@ async def _process_add(room_id: str, room_title: str, video_id: str):
                 "playlistUrl": _playlist_url(pid),
                 "videoId": video_id,
             }
-        if e.status_code == 404 and _is_playlist_not_found(e.detail):
-            await redis.delete(_playlist_key(room_id))
-            log.warning(json.dumps({"type": "playlist_not_found_recreate", "roomId": room_id, "oldPlaylistId": pid}))
-            new_pid = await ensure_playlist_id(room_id, room_title)
-            try:
-                await add_to_playlist_items(new_pid, video_id)
-                await redis.sadd(videos_key, video_id)
-                log.info(json.dumps({"type": "add_success_after_recreate", "roomId": room_id, "playlistId": new_pid, "videoId": video_id}))
-                return {
-                    "status": "added",
-                    "roomId": room_id,
-                    "playlistId": new_pid,
-                    "playlistUrl": _playlist_url(new_pid),
-                    "videoId": video_id,
-                }
-            except HTTPException as e2:
-                if e2.status_code == 429 and "quotaExceeded" in str(e2.detail):
-                    await redis.lpush(pending_key, video_id)
-                    log.warning(json.dumps({"type": "add_queued_quota_after_recreate", "roomId": room_id, "videoId": video_id, "playlistId": new_pid}))
-                    return {
-                        "status": "queued",
-                        "reason": "quotaExceeded",
-                        "roomId": room_id,
-                        "playlistId": new_pid,
-                        "playlistUrl": _playlist_url(new_pid),
-                        "videoId": video_id,
-                    }
-                log.error(json.dumps({"type": "add_failed_after_recreate", "roomId": room_id, "videoId": video_id, "status": e2.status_code, "detail": str(e2.detail)[:500]}))
-                raise
-        await redis.srem(videos_key, video_id)
-        log.error(json.dumps({"type": "add_failed_http", "roomId": room_id, "videoId": video_id, "status": e.status_code, "detail": str(e.detail)[:500]}))
+        log.error(json.dumps({"type":"add_failed_http","roomId":room_id,"videoId":video_id,"status":e.status_code,"detail":str(e.detail)[:500]}))
         raise
     except Exception as ex:
-        await redis.srem(videos_key, video_id)
-        log.exception(json.dumps({"type": "add_failed_exception", "roomId": room_id, "videoId": video_id, "error": str(ex)}))
+        log.exception(json.dumps({"type":"add_failed_exception","roomId":room_id,"videoId":video_id,"error":str(ex)}))
         raise
+    finally:
+        await _release_lock(lock_key)
 
 
 
@@ -825,18 +816,35 @@ async def flush(roomId: str | None = None, maxOps: int = 100):
             vid = await redis.rpop(pending_key)
             if not vid:
                 break
+            lock_key = f"lock:add:{rid}:{vid}"
+            got_lock = await redis.set(lock_key, "1", ex=30, nx=True)
+            if not got_lock:
+                await redis.rpush(pending_key, vid)
+                continue
             try:
+                try:
+                    if await _video_in_playlist(pid, vid):
+                        await redis.sadd(videos_key, vid)
+                        processed.append({"roomId": rid, "videoId": vid, "status": "skipped"})
+                        ops += 1
+                        continue
+                except HTTPException:
+                    pass
                 await add_to_playlist_items(pid, vid)
                 await redis.sadd(videos_key, vid)
                 processed.append({"roomId": rid, "videoId": vid, "status": "added"})
             except HTTPException as e:
                 if e.status_code == 429 and "quotaExceeded" in str(e.detail):
                     await redis.rpush(pending_key, vid)
-                    ops = maxOps
                     processed.append({"roomId": rid, "videoId": vid, "status": "queued"})
                     break
                 await redis.srem(videos_key, vid)
                 processed.append({"roomId": rid, "videoId": vid, "status": "error", "detail": str(e.detail)})
+            finally:
+                try:
+                    await redis.delete(lock_key)
+                except Exception:
+                    pass
             ops += 1
         log.info(json.dumps({"type": "flush_room_done", "roomId": rid, "processed": len(processed)}))
     return {"processed": processed}
