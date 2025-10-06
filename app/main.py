@@ -323,11 +323,13 @@ async def auth_url(request: Request):
     }
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
     log.info(json.dumps({
-        "type":"auth_url_debug",
-        "index": idx + 1,
-        "client_id_suffix": client["id"][-12:],
-        "redirect_uri": redirect_uri
-        }))
+    "type": "auth_url_debug",
+    "index": idx + 1,
+    "client_id": client["id"],
+    "client_id_head": client["id"][:20],
+    "client_id_tail": client["id"][-24:],
+    "redirect_uri": redirect_uri
+    }))
     return {"url": url, "index": idx + 1}
 
 @app.get("/oauth2/callback")
