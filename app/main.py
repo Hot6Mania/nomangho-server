@@ -20,13 +20,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from redis.asyncio import Redis
+from dotenv import load_dotenv
 
 class AddByUrlRequest(BaseModel):
     roomId: str
     roomTitle: str
     url: str
 
-load_dotenv()
+ENV_PATH = "/etc/nomangho.env"
+
+for k in list(os.environ.keys()):
+    if k.startswith("YOUTUBE_") or k in {"REDIS_URL", "HOST", "PORT"}:
+        os.environ.pop(k)
+
+load_dotenv(ENV_PATH, override=True)
 
 def _setup_logging():
     level = os.getenv("LOG_LEVEL", "INFO").upper()
