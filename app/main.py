@@ -349,6 +349,11 @@ async def oauth2_callback(request: Request):
         log.warning(json.dumps({"type": "oauth_no_refresh_token", "index": idx, "status": resp.status_code}))
     return {"index": idx + 1, **data}
 
+@app.get("/oauth/callback")
+async def oauth_callback_alias(request: Request):
+    return await oauth2_callback(request)
+
+
 async def create_playlist(title: str) -> str:
     body = {
         "snippet": {"title": title, "description": "Auto-created from SyncTube"},
