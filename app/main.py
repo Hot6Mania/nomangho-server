@@ -105,8 +105,9 @@ class SearchReq(BaseModel):
     channel_hint: Optional[str] = Field(None, max_length=120)
     duration_hint_sec: Optional[int] = Field(None, ge=5, le=60*60*3)
     max_results: int = Field(8, ge=1, le=15)
-    region: Optional[str] = "KR"
-    lang: Optional[str] = "ko"
+    region: Optional[str] = "JP"
+    lang: Optional[str] = "ja"
+    auto_locale: bool = True
 
 class Candidate(BaseModel):
     videoId: str
@@ -162,6 +163,12 @@ async def _shutdown():
     if redis:
         log.info("shutdown: closing redis")
         await redis.aclose()
+
+def _has_jp(s: str) -> bool:
+    return bool(re.search(r"[\u3040-\u30FF\u4E00-\u9FFF]", s or ""))
+
+def _has_kr(s: str) -> bool:
+    return bool(re.search(r"[\uAC00-\uD7A3]", s or ""))
 
 def _playlist_key(room_id: str) -> str:
     return f"room:{room_id}:playlist"
@@ -658,61 +665,89 @@ async def _perform_search(req: SearchReq, *, skip_cache: bool = False, track_nor
     ch_norm = _normalize(req.channel_hint or "")
     if len(q_norm) < 1:
         raise HTTPException(400, detail="query too short after normalization")
-    cache_key = f"ytsearch:v3:{req.region}:{req.lang}:{q_norm}|{ch_norm}|{req.max_results}|{track_norm or ''}"
-    cached = None if skip_cache else await redis.get(cache_key)
-    if cached:
-        try:
-            res = SearchRes(**json.loads(cached))
-            log.info(json.dumps({"type": "search_cache_hit", "key": cache_key}))
-            return res
-        except Exception:
-            await redis.delete(cache_key)
-            log.warning(json.dumps({"type": "search_cache_corrupt", "key": cache_key}))
-    if _api_key_cycle:
-        key = next(_api_key_cycle)
-        async with httpx.AsyncClient() as http:
-            items = await _yt_search_with_key(http, key, req.query, req.max_results, req.region, req.lang)
-            ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
-            meta = await _yt_videos_with_key(http, key, ids) if ids else []
-    else:
-        items = await _yt_search_with_oauth(req.query, req.max_results, req.region, req.lang)
-        ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
-        meta = await _yt_videos_with_oauth(ids) if ids else []
-    id2m: Dict[str, dict] = {m["id"]: m for m in meta}
-    cands: List[Candidate] = []
-    for it in items:
-        vid = it["id"]["videoId"]
-        m = id2m.get(vid)
-        if not m:
-            continue
-        dur = _iso8601_to_sec(m.get("contentDetails", {}).get("duration"))
-        score = _score_candidate(
-            q_norm,
-            ch_norm,
-            m["snippet"]["title"],
-            m["snippet"]["channelTitle"],
-            req.duration_hint_sec,
-            dur,
-            track_norm=track_norm,
+
+    def _locale_candidates() -> List[tuple[str,str]]:
+        if not req.auto_locale:
+            return [(req.region or "JP", req.lang or "ja"), ("KR","ko")]
+        q = req.query + " " + (req.channel_hint or "")
+        if _has_jp(q) and not _has_kr(q):
+            return [("JP","ja"), ("KR","ko")]
+        if _has_kr(q) and not _has_jp(q):
+            return [("KR","ko"), ("JP","ja")]
+        return [("JP","ja"), ("KR","ko")]
+
+    tried = []
+    best_overall: Optional[SearchRes] = None
+    for region, lang in _locale_candidates():
+        tmp = SearchReq(
+            query=req.query,
+            channel_hint=req.channel_hint,
+            duration_hint_sec=req.duration_hint_sec,
+            max_results=req.max_results,
+            region=region,
+            lang=lang,
         )
-        cands.append(Candidate(
-            videoId=vid,
-            title=m["snippet"]["title"],
-            channelTitle=m["snippet"]["channelTitle"],
-            channelId=m["snippet"]["channelId"],
-            durationSec=dur,
-            score=round(score, 4)
-        ))
-    cands.sort(key=lambda x: x.score, reverse=True)
-    best = cands[0] if cands else None
-    if not best or best.score < 0.62:
-        res = SearchRes(best=None, alternatives=cands[:5], reason="ambiguous_or_low_score" if cands else "no_results")
-    else:
-        res = SearchRes(best=best, alternatives=cands[1:5])
-    if not skip_cache:
-        await redis.setex(cache_key, int(timedelta(hours=24).total_seconds()), json.dumps(res.dict()))
-    log.info(json.dumps({"type": "search_done", "q": req.query, "best_score": float(best.score) if best else None, "alts": len(res.alternatives), "reason": res.reason}))
-    return res
+        cache_key = f"ytsearch:v3:{tmp.region}:{tmp.lang}:{_normalize(tmp.query)}|{_normalize(tmp.channel_hint or '')}|{tmp.max_results}|{track_norm or ''}"
+        cached = None if skip_cache else await redis.get(cache_key)
+        if cached:
+            try:
+                res = SearchRes(**json.loads(cached))
+            except Exception:
+                await redis.delete(cache_key)
+                res = None
+        else:
+            if _api_key_cycle:
+                key = next(_api_key_cycle)
+                async with httpx.AsyncClient() as http:
+                    items = await _yt_search_with_key(http, key, tmp.query, tmp.max_results, tmp.region, tmp.lang)
+                    ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+                    meta = await _yt_videos_with_key(http, key, ids) if ids else []
+            else:
+                items = await _yt_search_with_oauth(tmp.query, tmp.max_results, tmp.region, tmp.lang)
+                ids = [it["id"]["videoId"] for it in items if it.get("id", {}).get("videoId")]
+                meta = await _yt_videos_with_oauth(ids) if ids else []
+            id2m: Dict[str, dict] = {m["id"]: m for m in meta}
+            cands: List[Candidate] = []
+            for it in items:
+                vid = it["id"]["videoId"]
+                m = id2m.get(vid)
+                if not m:
+                    continue
+                dur = _iso8601_to_sec(m.get("contentDetails", {}).get("duration"))
+                score = _score_candidate(
+                    _normalize(tmp.query),
+                    _normalize(tmp.channel_hint or ""),
+                    m["snippet"]["title"],
+                    m["snippet"]["channelTitle"],
+                    tmp.duration_hint_sec,
+                    dur,
+                    track_norm=track_norm,
+                )
+                cands.append(Candidate(
+                    videoId=vid,
+                    title=m["snippet"]["title"],
+                    channelTitle=m["snippet"]["channelTitle"],
+                    channelId=m["snippet"]["channelId"],
+                    durationSec=dur,
+                    score=round(score, 4)
+                ))
+            cands.sort(key=lambda x: x.score, reverse=True)
+            best = cands[0] if cands else None
+            if not best or best.score < 0.62:
+                res = SearchRes(best=None, alternatives=cands[:5], reason="ambiguous_or_low_score" if cands else "no_results")
+            else:
+                res = SearchRes(best=best, alternatives=cands[1:5])
+            if not skip_cache:
+                await redis.setex(cache_key, int(timedelta(hours=24).total_seconds()), json.dumps(res.dict()))
+
+        tried.append((region, lang, float(res.best.score) if res.best else 0.0))
+        if res.best and res.best.score >= 0.62:
+            best_overall = res
+            break
+        if not best_overall or (res.best and res.best.score > (best_overall.best.score if best_overall.best else 0.0)):
+            best_overall = res
+
+    return best_overall
 
 @app.post("/search", response_model=SearchRes)
 async def search(req: SearchReq):
