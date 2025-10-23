@@ -5,15 +5,20 @@ import time
 import uuid
 import unicodedata
 import logging
+import asyncio
+import tempfile
+import stat
 from urllib.parse import urlparse, parse_qs, urlencode
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta
+from pathlib import Path
 
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
     ZoneInfo = None  # type: ignore
 
+import fcntl
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,12 +33,86 @@ class AddByUrlRequest(BaseModel):
     url: str
 
 ENV_PATH = "/etc/nomangho.env"
+ENV_FILE = Path(ENV_PATH)
+ENV_LOCK = ENV_FILE.with_name(ENV_FILE.name + ".lock")
+_DEFAULT_ENV_MODE = 0o640
+
+
+class RefreshTokenPersistError(RuntimeError):
+    """Raised when persisting a refresh token fails."""
+
 
 for k in list(os.environ.keys()):
     if k.startswith("YOUTUBE_") or k in {"REDIS_URL", "HOST", "PORT"}:
         os.environ.pop(k)
 
 load_dotenv(ENV_PATH, override=True)
+
+
+def _persist_env_values_sync(updates: Dict[str, str]):
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ENV_LOCK.touch(exist_ok=True)
+
+    with open(ENV_LOCK, "r+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            lines: List[str]
+            if ENV_FILE.exists():
+                with open(ENV_FILE, "r", encoding="utf-8") as env_file:
+                    lines = env_file.readlines()
+                current_mode = stat.S_IMODE(os.stat(ENV_FILE).st_mode)
+            else:
+                lines = []
+                current_mode = _DEFAULT_ENV_MODE
+
+            seen_keys = set()
+            new_lines: List[str] = []
+            for line in lines:
+                normalized = line.rstrip("\n")
+                if "=" in normalized and not normalized.lstrip().startswith("#"):
+                    key, _ = normalized.split("=", 1)
+                    key = key.strip()
+                    if key in updates:
+                        new_lines.append(f"{key}={updates[key]}\n")
+                        seen_keys.add(key)
+                        continue
+                new_lines.append(line if line.endswith("\n") else line + "\n")
+
+            for key, value in updates.items():
+                if key not in seen_keys:
+                    new_lines.append(f"{key}={value}\n")
+
+            if not new_lines:
+                new_lines = [f"{key}={value}\n" for key, value in updates.items()]
+
+            tmp_path = None
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(ENV_FILE.parent),
+                prefix=ENV_FILE.name + ".",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                    tmp_file.writelines(new_lines)
+                try:
+                    os.chmod(tmp_path, current_mode)
+                except PermissionError:
+                    pass
+                os.replace(tmp_path, ENV_FILE)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+async def _persist_env_values(updates: Dict[str, str]):
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _persist_env_values_sync(updates)
+        return
+    await loop.run_in_executor(None, _persist_env_values_sync, updates)
 
 def _setup_logging():
     level = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -90,6 +169,27 @@ _TRACK_RESOLVE_TTL = int(timedelta(hours=12).total_seconds())
 _TRACK_RESOLVE_MISS_TTL = int(timedelta(minutes=30).total_seconds())
 _TRACK_RESOLVE_THRESHOLD = 0.58
 _TRACK_RESOLVE_MISS_SENTINEL = "__MISS__"
+
+
+async def _store_refresh_token(idx: int, token: str):
+    if redis is None:
+        raise RefreshTokenPersistError("Redis client is not initialised")
+
+    env_key = f"YOUTUBE_REFRESH_TOKEN{idx + 1}"
+    try:
+        await _persist_env_values({env_key: token})
+    except Exception as exc:
+        raise RefreshTokenPersistError(f"Failed to update env file: {exc}") from exc
+
+    os.environ[env_key] = token
+    YT_CLIENTS[idx]["refresh"] = token
+
+    try:
+        await redis.set(f"yt:refresh_token:{idx}", token)
+    except Exception as exc:
+        raise RefreshTokenPersistError(f"Failed to store refresh token in redis: {exc}") from exc
+
+    log.info(json.dumps({"type": "refresh_token_persisted", "index": idx, "env_key": env_key}))
 
 class AddRequest(BaseModel):
     roomId: str
@@ -286,6 +386,15 @@ async def get_access_token() -> str:
         }))
         raise HTTPException(status_code=500, detail=f"Token refresh failed: {resp.text}")
     data = resp.json()
+    if "refresh_token" in data:
+        try:
+            await _store_refresh_token(idx, data["refresh_token"])
+        except RefreshTokenPersistError as exc:
+            log.error(json.dumps({
+                "type": "refresh_token_persist_failed",
+                "index": idx,
+                "error": str(exc),
+            }))
     token = data["access_token"]
     ttl = max(60, int(data.get("expires_in", 3600)) - 60)
     await redis.set(token_key, token, ex=ttl)
@@ -399,7 +508,15 @@ async def oauth2_callback(request: Request):
         )
     data = resp.json()
     if "refresh_token" in data:
-        await redis.set(f"yt:refresh_token:{idx}", data["refresh_token"])
+        try:
+            await _store_refresh_token(idx, data["refresh_token"])
+        except RefreshTokenPersistError as exc:
+            log.error(json.dumps({
+                "type": "oauth_store_refresh_failed",
+                "index": idx,
+                "error": str(exc),
+            }))
+            raise HTTPException(status_code=500, detail="Failed to persist refresh token") from exc
         log.info(json.dumps({"type": "oauth_store_refresh", "index": idx}))
     else:
         log.warning(json.dumps({"type": "oauth_no_refresh_token", "index": idx, "status": resp.status_code}))
