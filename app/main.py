@@ -32,9 +32,10 @@ class AddByUrlRequest(BaseModel):
     roomTitle: str
     url: str
 
-ENV_PATH = "/etc/nomangho.env"
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = str(BASE_DIR / ".nomangho.env")
 ENV_FILE = Path(ENV_PATH)
-ENV_LOCK = ENV_FILE.with_name(ENV_FILE.name + ".lock")
+ENV_LOCK = ENV_FILE.with_suffix(ENV_FILE.suffix + ".lock")
 _DEFAULT_ENV_MODE = 0o640
 
 
