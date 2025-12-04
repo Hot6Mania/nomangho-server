@@ -410,6 +410,12 @@ async def youtube_request(method: str, url: str, **kwargs):
             headers["Authorization"] = f"Bearer {token}"
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.request(method, url, headers=headers, **kwargs)
+            if resp.status_code == 401:
+                idx = await get_current_index()
+                token_key = f"yt:access_token:{idx}"
+                await redis.delete(token_key)
+                log.warning(json.dumps({"type": "yt_token_expired", "index": idx, "clearing_cache": True}))
+                continue
             if resp.status_code == 403 and _is_quota_exceeded(resp.text):
                 idx = await get_current_index()
                 await set_current_index(idx + 1)
